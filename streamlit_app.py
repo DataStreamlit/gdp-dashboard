@@ -723,6 +723,158 @@ def build_queries(selected_kpis, df, dt, hf, ff, g) -> str:
     return "\n\n\n".join(parts)
 
 
+
+
+# ─────────────────────── RAW DATA QUERY BUILDER ──────────────────────────────
+
+# Maps each KPI to the columns it needs from SW_EMERGENCY at patient level
+KPI_COLUMNS = {
+    1:  ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME","HIS"],
+    2:  ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME","UCC_FLAG","HIS"],
+    3:  ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME","PHYSICIAN_ASSIGNMENT_DATETIME","HIS"],
+    4:  ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME","TRIAGE_LEVEL_CODE","TRIAGE_LEVEL_DESC",
+         "PHYSICIAN_ASSIGNMENT_DATETIME","Earliest_Lab_Order_DateTime","Earliest_Rad_Order_DateTime","Earliest_Phar_Order_DateTime","HIS"],
+    5:  ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+         "Latest_Phar_Order_DateTime","Phar_Administr_DateTime","HIS"],
+    6:  ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME","TRIAGE_LEVEL_CODE","TRIAGE_LEVEL_DESC",
+         "Earliest_Lab_Order_DateTime","Earliest_Rad_Order_DateTime","Earliest_Phar_Order_DateTime","DECISION_DATETIME","HIS"],
+    7:  ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+         "DECISION_DATETIME","DISCHARGE_DATETIME","DISCHARGE_DESTINATION","HIS"],
+    8:  ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+         "DECISION_DATETIME","DISCHARGE_DATETIME","DISCHARGE_DESTINATION","HIS"],
+    9:  ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+         "DECISION_DATETIME","DISCHARGE_DATETIME","DISCHARGE_DESTINATION","ADMIT_LOCATION","HIS"],
+    10: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+         "DECISION_DATETIME","DISCHARGE_DATETIME","DISCHARGE_DESTINATION","HIS"],
+    11: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME","DISCHARGE_DATETIME","HIS"],
+    12: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME","DISCHARGE_DATETIME","FETCH_TIMESTAMP","HIS"],
+    13: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+         "DISCHARGE_DATETIME","DISCHARGE_DESTINATION","FETCH_TIMESTAMP","HIS"],
+    14: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+         "DISCHARGE_DATETIME","DISCHARGE_DESTINATION","FETCH_TIMESTAMP","HIS"],
+    15: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME","ARRIVAL_METHOD","HIS"],
+    16: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+         "LAB_ORDERS_STAT","STAT_LAB_TAT_hours","Earliest_Lab_Order_DateTime","Latest_Lab_Order_DateTime","HIS"],
+    17: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+         "LAB_ORDERS_STAT","STAT_LAB_TAT_hours_UCC","Earliest_Lab_Order_DateTime","Latest_Lab_Order_DateTime","HIS"],
+    18: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+         "RAD_ORDERS_STAT","STAT_RAD_TAT_hours","Earliest_Rad_Order_DateTime","Latest_Rad_Order_DateTime","HIS"],
+    19: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME","DISCHARGE_DESTINATION","HIS"],
+    20: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME","DISCHARGE_DESTINATION","HIS"],
+    21: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+         "DISCHARGE_DATETIME","PRINICIPAL_DIAGNOSIS","HIS"],
+    22: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME","DISCHARGE_DESTINATION","HIS"],
+    23: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+         "TRIAGE_LEVEL_CODE","TRIAGE_LEVEL_DESC","HIS"],
+    24: ["FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME","TRIAGE_DATETIME","HIS"],
+}
+
+# Computed columns — added to the SELECT as derived expressions alongside raw columns
+KPI_COMPUTED = {
+    3:  {"Door_to_Physician_Min": "DATEDIFF('minute', e.PATIENT_VISIT_DATETIME, e.PHYSICIAN_ASSIGNMENT_DATETIME)"},
+    4:  {"Earliest_Order_DateTime": "LEAST(COALESCE(e.Earliest_Lab_Order_DateTime,'9999-01-01'::TIMESTAMP),COALESCE(e.Earliest_Rad_Order_DateTime,'9999-01-01'::TIMESTAMP),COALESCE(e.Earliest_Phar_Order_DateTime,'9999-01-01'::TIMESTAMP))",
+         "Physician_to_Order_Min": "DATEDIFF('minute', e.PHYSICIAN_ASSIGNMENT_DATETIME, LEAST(COALESCE(e.Earliest_Lab_Order_DateTime,'9999-01-01'::TIMESTAMP),COALESCE(e.Earliest_Rad_Order_DateTime,'9999-01-01'::TIMESTAMP),COALESCE(e.Earliest_Phar_Order_DateTime,'9999-01-01'::TIMESTAMP)))"},
+    5:  {"Order_to_MedAdmin_Min": "DATEDIFF('minute', e.Latest_Phar_Order_DateTime, e.Phar_Administr_DateTime)"},
+    6:  {"Earliest_Order_DateTime": "LEAST(COALESCE(e.Earliest_Lab_Order_DateTime,'9999-01-01'::TIMESTAMP),COALESCE(e.Earliest_Rad_Order_DateTime,'9999-01-01'::TIMESTAMP),COALESCE(e.Earliest_Phar_Order_DateTime,'9999-01-01'::TIMESTAMP))",
+         "Order_to_Decision_Min": "DATEDIFF('minute', LEAST(COALESCE(e.Earliest_Lab_Order_DateTime,'9999-01-01'::TIMESTAMP),COALESCE(e.Earliest_Rad_Order_DateTime,'9999-01-01'::TIMESTAMP),COALESCE(e.Earliest_Phar_Order_DateTime,'9999-01-01'::TIMESTAMP)), COALESCE(e.DECISION_DATETIME, e.DISCHARGE_DATETIME))"},
+    7:  {"Decision_to_Disposition_Min": "DATEDIFF('minute', COALESCE(e.DECISION_DATETIME, e.DISCHARGE_DATETIME), e.DISCHARGE_DATETIME)"},
+    8:  {"Decision_to_Discharge_Home_Min": "DATEDIFF('minute', COALESCE(e.DECISION_DATETIME, e.DISCHARGE_DATETIME), e.DISCHARGE_DATETIME)"},
+    9:  {"Decision_to_Ward_Min": "DATEDIFF('minute', COALESCE(e.DECISION_DATETIME, e.DISCHARGE_DATETIME), e.DISCHARGE_DATETIME)"},
+    10: {"Decision_to_ICU_Min": "DATEDIFF('minute', COALESCE(e.DECISION_DATETIME, e.DISCHARGE_DATETIME), e.DISCHARGE_DATETIME)"},
+    11: {"LOS_Min": "DATEDIFF('minute', e.PATIENT_VISIT_DATETIME, e.DISCHARGE_DATETIME)",
+         "Within_4hrs": "CASE WHEN e.DISCHARGE_DATETIME IS NOT NULL AND DATEDIFF('minute',e.PATIENT_VISIT_DATETIME,e.DISCHARGE_DATETIME)<=240 THEN 'Yes' ELSE 'No' END"},
+    12: {"ED_ALOS_Min": "DATEDIFF('minute', e.PATIENT_VISIT_DATETIME, COALESCE(e.DISCHARGE_DATETIME, e.FETCH_TIMESTAMP))"},
+    13: {"ED_ALOS_Min": "DATEDIFF('minute', e.PATIENT_VISIT_DATETIME, COALESCE(e.DISCHARGE_DATETIME, e.FETCH_TIMESTAMP))"},
+    14: {"ED_ALOS_Min": "DATEDIFF('minute', e.PATIENT_VISIT_DATETIME, COALESCE(e.DISCHARGE_DATETIME, e.FETCH_TIMESTAMP))"},
+    16: {"STAT_Lab_TAT_Min": "ROUND(e.STAT_LAB_TAT_hours * 60, 2)"},
+    17: {"STAT_Lab_TAT_POCT_Min": "ROUND(e.STAT_LAB_TAT_hours_UCC * 60, 2)"},
+    18: {"STAT_Rad_TAT_Min": "ROUND(e.STAT_RAD_TAT_hours * 60, 2)"},
+    24: {"Door_to_Triage_Min": "DATEDIFF('minute', e.PATIENT_VISIT_DATETIME, e.TRIAGE_DATETIME)"},
+}
+
+# All available columns in SW_EMERGENCY for the "all columns" option
+ALL_SW_COLUMNS = [
+    "FACILITY_CODE_NHIC","ENCOUNTER_NUMBER","MRN","PATIENT_VISIT_DATETIME",
+    "ARRIVAL_METHOD","REASON_FOR_VISIT","TRIAGE_LEVEL_CODE","TRIAGE_LEVEL_DESC",
+    "TRIAGE_DATETIME","PHYSICIAN_ASSIGNMENT_DATETIME","PRINICIPAL_DIAGNOSIS",
+    "SECONDARY_DIAGNOSIS","DECISION_DATETIME","ADMIT_LOCATION",
+    "DISCHARGE_DESTINATION","DISCHARGE_DATETIME","FETCH_TIMESTAMP",
+    "LAB_ORDERS_ROUTINE","ROUTINE_LAB_TAT_hours","LAB_ORDERS_STAT",
+    "STAT_LAB_TAT_hours","Earliest_Lab_Order_DateTime","Latest_Lab_Order_DateTime",
+    "STAT_LAB_TAT_hours_UCC","RAD_ORDERS_ROUTINE","ROUTINE_RAD_TAT_hours",
+    "RAD_ORDERS_STAT","STAT_RAD_TAT_hours","STAT_RAD_TAT_hours_UCC",
+    "CT_ORDERS","CT_START_TIME_hours","CT_ORDERS_STROKE","CT_HOURS_STROKE",
+    "Earliest_Rad_Order_DateTime","Latest_Rad_Order_DateTime",
+    "C_PHARM_ORDERS","C_PHARM_ORDERS_COMPLETED","Earliest_Phar_Order_DateTime",
+    "Latest_Phar_Order_DateTime","Phar_Administr_DateTime",
+    "AGE_YEARS","GENDER","MARITAL_STATUS","NATIONALITY","RELIGION",
+    "UCC_FLAG","HIS",
+]
+
+
+def build_raw_query(selected_kpis, df, dt, hf, ff, col_mode, row_limit) -> str:
+    """
+    Generates a patient-level (non-aggregated) SELECT from SW_EMERGENCY.
+    col_mode: 'kpi_columns' | 'all_columns'
+    """
+    src = src_alias(hf, ff)
+
+    # Collect raw columns needed across all selected KPIs
+    if col_mode == "All columns":
+        raw_cols = ALL_SW_COLUMNS
+        computed = {}
+    else:
+        raw_cols_set = set()
+        computed = {}
+        for n in selected_kpis:
+            raw_cols_set.update(KPI_COLUMNS.get(n, []))
+            computed.update(KPI_COMPUTED.get(n, {}))
+        # Keep stable order matching ALL_SW_COLUMNS
+        raw_cols = [c for c in ALL_SW_COLUMNS if c in raw_cols_set]
+
+    # Build SELECT list
+    select_parts = [f"  e.{c}" for c in raw_cols]
+    for alias, expr in computed.items():
+        select_parts.append(f"  {expr}  AS {alias}")
+
+    # LU join needed?
+    dest_kpis = {8, 9, 10, 13, 14, 19, 20, 22}
+    needs_lu = bool(set(selected_kpis) & dest_kpis) or col_mode == "All columns"
+    if needs_lu and "DISCHARGE_DESTINATION" not in raw_cols and col_mode != "All columns":
+        select_parts.append("  e.DISCHARGE_DESTINATION")
+    if needs_lu:
+        select_parts.append("  d.DISCHARGE_DESTINATION_STANDARD")
+
+    limit_clause = f"\nLIMIT {row_limit}" if row_limit else ""
+
+    lu_join = f"\nLEFT JOIN {LU} d ON TRIM(e.DISCHARGE_DESTINATION) = TRIM(d.DISCHARGE_DESTINATION)" if needs_lu else ""
+
+    # Which KPI labels are we drilling into?
+    kpi_names = ", ".join(
+        f"KPI {n:02d} – {next((k['title'] for k in KPIS if k['n']==n), '')}"
+        for n in sorted(selected_kpis)
+    )
+
+    header = f"""/* {'='*66}
+   RAW PATIENT-LEVEL DATA
+   KPIs  : {kpi_names}
+   Source: SW_EMERGENCY (all 8 HIS — v8)
+   Mode  : {col_mode}
+   Note  : This is the unaggregated encounter-level data that feeds
+           the KPI aggregations above. Use to drill into individual
+           records, validate outliers, or export for analysis.
+{'='*66} */"""
+
+    sql = f"""{header}
+{cte_prefix(df, dt, hf, ff)}
+SELECT
+{chr(10).join(select_parts)}
+FROM {src} e{lu_join}
+ORDER BY e.PATIENT_VISIT_DATETIME DESC, e.FACILITY_CODE_NHIC, e.HIS{limit_clause}"""
+
+    return sql
+
+
 # ─────────────────────── UI ───────────────────────────────────────────────────
 
 st.markdown("""
@@ -734,6 +886,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🏥 ED KPI Query Builder")
+st.caption("SW_EMERGENCY — all 8 HIS systems (MCC · CAREWARE · OASIS · VIDAPLUS · ARCUSAIR · VIDA · INTERSYSTEM · EPIC) · v8")
 
 # ── Sidebar filters ────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -792,24 +945,99 @@ for i, kpi in enumerate(KPIS):
 selected = sorted(st.session_state["sel"])
 st.caption(f"**{len(selected)} of 24 KPIs selected**")
 
-# ── Generate SQL ───────────────────────────────────────────────────────────────
+# ── Tabs: KPI SQL  |  Raw Data ────────────────────────────────────────────────
 st.divider()
-st.subheader("Generated SQL")
 
 if not selected:
     st.info("Select at least one KPI above to generate SQL.")
 else:
     ff = facility.strip() if facility.strip() and facility.strip().upper() != "ALL" else ""
-    sql_out = build_queries(selected, df_str, dt_str, his, ff, gran)
 
-    st.code(sql_out, language="sql", line_numbers=True)
+    tab_kpi, tab_raw = st.tabs(["📊 KPI Aggregated Queries", "🔍 Raw Patient-Level Data"])
 
-    col1, col2 = st.columns([1, 5])
-    col1.download_button(
-        label="⬇️ Download .sql",
-        data=sql_out,
-        file_name=f"ed_kpi_query_{date.today()}.sql",
-        mime="text/plain",
-    )
-    dt_label = f"  to  {dt_str}" if dt_str else ""
-    col2.caption(f"Query generated for {len(selected)} KPI(s) · HIS: {his} · Gran: {gran} · Date: {df_str}{dt_label}")
+    # ── Tab 1: KPI queries ─────────────────────────────────────────────────────
+    with tab_kpi:
+        sql_out = build_queries(selected, df_str, dt_str, his, ff, gran)
+        st.code(sql_out, language="sql", line_numbers=True)
+        col1, col2 = st.columns([1, 5])
+        col1.download_button(
+            label="⬇️ Download .sql",
+            data=sql_out,
+            file_name=f"ed_kpi_query_{date.today()}.sql",
+            mime="text/plain",
+        )
+        dt_label = f"  to  {dt_str}" if dt_str else ""
+        col2.caption(f"Query generated for {len(selected)} KPI(s) · HIS: {his} · Gran: {gran} · Date: {df_str}{dt_label}")
+
+    # ── Tab 2: Raw patient-level data ──────────────────────────────────────────
+    with tab_raw:
+        st.markdown("""
+        **Raw encounter-level query** — returns one row per patient visit with the exact columns
+        that feed the selected KPIs. Use this to:
+        - Drill into individual records behind an aggregated KPI value
+        - Validate outliers or unexpected results
+        - Export data for further analysis in Excel / Power BI
+        """)
+
+        rcol1, rcol2, rcol3 = st.columns(3)
+
+        with rcol1:
+            col_mode = st.radio(
+                "Columns to include",
+                ["KPI-relevant columns only", "All columns"],
+                help="KPI-relevant: only the columns needed for the selected KPIs.  All columns: every field in SW_EMERGENCY.",
+            )
+
+        with rcol2:
+            row_limit = st.selectbox(
+                "Row limit",
+                [100, 500, 1000, 5000, 10000, 0],
+                index=1,
+                format_func=lambda x: f"Top {x:,} rows" if x > 0 else "No limit (⚠️ can be large)",
+            )
+
+        with rcol3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            show_computed = st.checkbox(
+                "Include computed KPI columns",
+                value=True,
+                help="Adds derived columns such as Door_to_Physician_Min, ALOS_Min etc. alongside the raw timestamps.",
+            )
+
+        # Build the raw query
+        col_mode_key = "All columns" if col_mode == "All columns" else "kpi_columns"
+        raw_sql = build_raw_query(
+            selected_kpis=selected,
+            df=df_str,
+            dt=dt_str,
+            hf=his,
+            ff=ff,
+            col_mode=col_mode,
+            row_limit=row_limit,
+        )
+
+        # If user unchecked computed columns, strip computed section
+        if not show_computed:
+            lines = raw_sql.split("\n")
+            filtered = []
+            for line in lines:
+                # Skip lines that contain alias patterns like "AS Door_to_" etc.
+                skip = any(k in line for k in ["_Min", "_POCT_", "Within_4hrs",
+                                                "Earliest_Order_", "ALOS_", "POCT"])
+                if not skip:
+                    filtered.append(line)
+            raw_sql = "\n".join(filtered)
+
+        st.code(raw_sql, language="sql", line_numbers=True)
+
+        rcol_dl1, rcol_dl2 = st.columns([1, 5])
+        rcol_dl1.download_button(
+            label="⬇️ Download raw .sql",
+            data=raw_sql,
+            file_name=f"ed_raw_data_{date.today()}.sql",
+            mime="text/plain",
+            key="dl_raw",
+        )
+        kpi_labels = ", ".join(f"KPI {n}" for n in selected)
+        dt_label = f" to {dt_str}" if dt_str else ""
+        rcol_dl2.caption(f"Patient-level query · {col_mode} · {len(selected)} KPI(s): {kpi_labels} · Date: {df_str}{dt_label}")
