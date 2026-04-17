@@ -875,6 +875,392 @@ ORDER BY e.PATIENT_VISIT_DATETIME DESC, e.FACILITY_CODE_NHIC, e.HIS{limit_clause
     return sql
 
 
+
+# ─────────────────────── ORDER-LEVEL QUERY BUILDER ───────────────────────────
+
+LAB_KPIS   = {4, 6, 16, 17}
+RAD_KPIS   = {4, 6, 18}
+PHARM_KPIS = {4, 5, 6}
+
+def build_order_queries(selected_kpis, df, dt, hf, ff, order_types, row_limit):
+    """
+    Generates one SELECT per order type (Lab / Radiology / Pharmacy).
+    Joins raw per-HIS order tables directly to the encounter spine —
+    one row per order, NOT grouped by encounter.
+    """
+
+    ub_mcc   = f" AND CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) <= {dt}" if dt else ""
+    ub_cw    = f" AND CAST(em.PATIENT_VISIT_DATE AS DATE) <= {dt}"      if dt else ""
+    ub_arc   = f" AND CAST(em.VISITDATE AS DATE) <= {dt}"               if dt else ""
+    ub_oasis = f" AND CAST(eb.VISIT_DATE_TIME AS DATE) <= {dt}"         if dt else ""
+    ub_vp    = f" AND CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) <= {dt}" if dt else ""
+    ub_vida  = f" AND CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) <= {dt}" if dt else ""
+    ub_is    = f" AND CAST(em.VISIT_DATE AS DATE) <= {dt}"              if dt else ""
+    ub_epic  = f" AND CAST(em.ARRIVALINSTANT AS DATE) <= {dt}"          if dt else ""
+
+    enc_cte = f"""ENCOUNTERS AS (
+  SELECT CAST(em.FACILILTY_CODE AS STRING) AS FACILITY_CODE_NHIC,
+         CAST(em.ENCOUNTER_NUMBER AS STRING) AS ENCOUNTER_NUMBER,
+         CAST(em.MEDICAL_RECORD_NUMBER_MRN AS STRING) AS MRN,
+         em.PATIENT_VISIT_DATE_TIME AS PATIENT_VISIT_DATETIME, 'MCC' AS HIS
+  FROM NMR.MCC.EMERGENCY em
+  WHERE CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) >= {df}{ub_mcc}
+  UNION ALL
+  SELECT CAST(em.FACILITY_CODE_NHIC AS STRING), CAST(em.ENCOUNTER_NUMBER AS STRING),
+         CAST(em.MEDICAL_RECORD_NUMBER_MRN AS STRING), em.PATIENT_VISIT_DATE, 'CAREWARE'
+  FROM NMR.CAREWARE.EMERGENCY em
+  WHERE CAST(em.PATIENT_VISIT_DATE AS DATE) >= {df}{ub_cw}
+  UNION ALL
+  SELECT CAST(eb.NHIC_CODE AS STRING), CAST(eb.ENCOUNTER_NUMBER AS STRING),
+         CAST(eb.MRN AS STRING), eb.VISIT_DATE_TIME, 'OASIS'
+  FROM NMR.OASIS.EMERGENCY eb
+  WHERE CAST(eb.VISIT_DATE_TIME AS DATE) >= {df}{ub_oasis} AND eb.TRIAGE_LEVEL IS NOT NULL
+  UNION ALL
+  SELECT CAST(em.FACILITY_NHIC_CODE AS STRING), CAST(em.ENCOUNTER_NO AS STRING),
+         CAST(em.MRN AS STRING), em.PATIENT_VISIT_DATE_TIME, 'VIDAPLUS'
+  FROM NMR.VIDAPLUS.EMERGENCY em
+  WHERE CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) >= {df}{ub_vp}
+  UNION ALL
+  SELECT CAST(em.FACILITYID AS STRING), CAST(em.ENCOUNTER_NUMBER AS STRING),
+         CAST(em.MRN AS STRING), em.VISITDATE, 'ArcusAir'
+  FROM NMR.ARCUSAIR.EMERGENCY em
+  WHERE CAST(em.VISITDATE AS DATE) >= {df}{ub_arc}
+  UNION ALL
+  SELECT CAST(em."FACILITY_CODE(NHIC)" AS STRING), CAST(em.ENCOUNTER_NUMBER AS STRING),
+         CAST(em.MRN AS STRING), em.PATIENT_VISIT_DATE_TIME, 'VIDA'
+  FROM NMR.VIDA.EMERGENCY em
+  WHERE CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) >= {df}{ub_vida}
+  UNION ALL
+  SELECT CAST(em.FACILITY_NHIC AS STRING), CAST(em.ENCOUNTER_NUMBER AS STRING),
+         CAST(em.MRN AS STRING), em.VISIT_DATE, 'INTERSYSTEM'
+  FROM NMR.INTERSYSTEM.EMERGENCY em
+  WHERE CAST(em.VISIT_DATE AS DATE) >= {df}{ub_is}
+  UNION ALL
+  SELECT CAST(em.NHIC_CODE AS STRING), CAST(em.ENCOUNTEREPICCSN AS STRING),
+         CAST(em.PRIMARYMRN AS STRING), em.ARRIVALINSTANT, 'EPIC'
+  FROM NMR.EPIC.EMERGENCY em
+  WHERE CAST(em.ARRIVALINSTANT AS DATE) >= {df}{ub_epic}
+)"""
+
+    # optional HIS / facility filter on the encounter spine
+    spine_filter = ""
+    if hf != "ALL": spine_filter += f"\n  AND HIS = '{hf}'"
+    if ff:          spine_filter += f"\n  AND FACILITY_CODE_NHIC = '{ff}'"
+    if dt:          spine_filter += f"\n  AND PATIENT_VISIT_DATETIME::DATE <= {dt}"
+    enc_src = f"(SELECT * FROM ENCOUNTERS WHERE 1=1{spine_filter}) e" if spine_filter else "ENCOUNTERS e"
+
+    limit = f"\nLIMIT {row_limit}" if row_limit else ""
+    sep = "=" * 66
+    parts = []
+
+    # ── LAB ──────────────────────────────────────────────────────────────────
+    if "Lab" in order_types:
+        parts.append(f"""/* {sep}
+   ORDER-LEVEL: LAB ORDERS — one row per lab test per encounter
+   Source : Raw NMR.*. LAB tables joined to encounter spine
+   Columns: encounter + order_id + priority + order/specimen/result datetimes + TAT (min)
+   Notes  : MCC uses LAB_ODER_DATE_TIME (typo in source schema).
+            INTERSYSTEM and EPIC have no lab sub-tables → 0 rows for those HIS.
+{sep} */
+WITH
+{enc_cte},
+
+LAB_ORDERS AS (
+  -- MCC
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    CAST(l.LAB_ORDER_ID AS STRING)           AS ORDER_ID,
+    UPPER(TRIM(l.PRIORITY))                  AS ORDER_PRIORITY,
+    l.LAB_ODER_DATE_TIME                     AS ORDER_DATETIME,
+    l.RECEIVING_DATE_TIME                    AS SPECIMEN_RECEIVED_DATETIME,
+    l.RESULT_DATE_TIME                       AS RESULT_DATETIME,
+    DATEDIFF('minute', l.LAB_ODER_DATE_TIME, l.RESULT_DATE_TIME)    AS Order_to_Result_Min,
+    DATEDIFF('minute', l.RECEIVING_DATE_TIME, l.RESULT_DATE_TIME)   AS Specimen_to_Result_Min
+  FROM {enc_src}
+  JOIN NMR.MCC.LAB l
+    ON e.ENCOUNTER_NUMBER    = CAST(l.ENCOUNTER_NUMBER AS STRING)
+   AND e.FACILITY_CODE_NHIC  = CAST(l.FACILILTY_CODE AS STRING)
+   AND e.HIS = 'MCC'
+
+  UNION ALL
+
+  -- CAREWARE
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    CAST(l.LAB_ORDER_ID AS STRING),
+    UPPER(TRIM(l.ATS_LAB_PRIORITY_DESC)),
+    l.LAB_ORDER_DATE, l.RECEIVING_DATE, l.RESULT_DATE,
+    DATEDIFF('minute', l.LAB_ORDER_DATE, l.RESULT_DATE),
+    DATEDIFF('minute', l.RECEIVING_DATE, l.RESULT_DATE)
+  FROM {enc_src}
+  JOIN NMR.CAREWARE.LAB l
+    ON e.ENCOUNTER_NUMBER = CAST(l.ENCOUNTER_NUMBER AS STRING) AND e.HIS = 'CAREWARE'
+
+  UNION ALL
+
+  -- OASIS
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    CAST(l.LAB_ORDER_ID AS STRING),
+    UPPER(TRIM(l.LAB_ORDER_PRIORITY)),
+    l.LAB_ORDER_DATE_TIME, l.RECEIVING_DATE_TIME, l.RESULT_DATE_TIME,
+    DATEDIFF('minute', l.LAB_ORDER_DATE_TIME, l.RESULT_DATE_TIME),
+    DATEDIFF('minute', l.RECEIVING_DATE_TIME,  l.RESULT_DATE_TIME)
+  FROM {enc_src}
+  JOIN (SELECT DISTINCT NHIC_CODE, ENCOUNTER_NUMBER, MRN, LAB_ORDER_ID
+        FROM NMR.OASIS.EMERGENCY WHERE LAB_ORDER_ID IS NOT NULL) ek
+    ON e.FACILITY_CODE_NHIC = CAST(ek.NHIC_CODE AS STRING)
+   AND e.ENCOUNTER_NUMBER   = CAST(ek.ENCOUNTER_NUMBER AS STRING)
+   AND e.HIS = 'OASIS'
+  JOIN NMR.OASIS.LAB l ON ek.NHIC_CODE = l.NHIC_CODE AND ek.LAB_ORDER_ID = l.LAB_ORDER_ID
+
+  UNION ALL
+
+  -- VIDAPLUS
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    l.LAB_ORDER_ID,
+    UPPER(TRIM(l.LAB_ORDER_PRIORITY)),
+    l.LAB_ORDER_REQUESTED_DATE_TIME, l.SAMPLE_RECEIVING_DATE_TIME, l.RESULTED_DATE_TIME,
+    DATEDIFF('minute', l.LAB_ORDER_REQUESTED_DATE_TIME, l.RESULTED_DATE_TIME),
+    DATEDIFF('minute', l.SAMPLE_RECEIVING_DATE_TIME,    l.RESULTED_DATE_TIME)
+  FROM {enc_src}
+  JOIN (SELECT DISTINCT FACILITY_NHIC_CODE, ENCOUNTER_NO, MRN,
+               TRIM(f.value::STRING) AS LAB_ORDER_ID
+        FROM NMR.VIDAPLUS.EMERGENCY,
+             LATERAL FLATTEN(INPUT=>SPLIT(REGEXP_REPLACE(NVL(LAB_ORDER_IDS,''),'\\s+',''),',')) f
+        WHERE f.value IS NOT NULL AND TRIM(f.value::STRING) NOT IN ('','NULL')) vk
+    ON e.FACILITY_CODE_NHIC = CAST(vk.FACILITY_NHIC_CODE AS STRING)
+   AND e.ENCOUNTER_NUMBER   = CAST(vk.ENCOUNTER_NO AS STRING)
+   AND e.HIS = 'VIDAPLUS'
+  JOIN NMR.VIDAPLUS.LAB l
+    ON vk.LAB_ORDER_ID = l.LAB_ORDER_ID AND vk.FACILITY_NHIC_CODE = l.FACILITY_NHIC_CODE
+
+  UNION ALL
+
+  -- ARCUSAIR
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    CAST(l.LAB_ORDER_CODE AS STRING),
+    UPPER(TRIM(l.LAB_ORDER_PRIORITY)),
+    l.LAB_ORDER_DATETIME, l.RECEIVINGDATETIME, l.RESULTDATETIME,
+    DATEDIFF('minute', l.LAB_ORDER_DATETIME, l.RESULTDATETIME),
+    DATEDIFF('minute', l.RECEIVINGDATETIME,  l.RESULTDATETIME)
+  FROM {enc_src}
+  JOIN NMR.ARCUSAIR.EMERGENCY ea
+    ON e.FACILITY_CODE_NHIC = CAST(ea.FACILITYID AS STRING)
+   AND e.ENCOUNTER_NUMBER   = CAST(ea.ENCOUNTER_NUMBER AS STRING)
+   AND e.HIS = 'ArcusAir'
+  JOIN NMR.ARCUSAIR.LAB l
+    ON ea.LAB_ORDER = l.LAB_ORDER_ID AND ea.FACILITYID = l.FACILITYID AND ea.MRN = l.MRN
+)
+SELECT * FROM LAB_ORDERS
+ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit}""")
+
+    # ── RADIOLOGY ─────────────────────────────────────────────────────────────
+    if "Radiology" in order_types:
+        parts.append(f"""/* {sep}
+   ORDER-LEVEL: RADIOLOGY ORDERS — one row per radiology order per encounter
+   Source : Raw NMR.*. RADIOLOGY tables joined to encounter spine
+   Columns: encounter + order_id + service_name + priority + order/exam/report datetimes + TAT (min)
+   Notes  : VIDAPLUS alias bug (STAT_RAD_STAT_hours) does NOT affect this raw query.
+            INTERSYSTEM and EPIC have no radiology sub-tables → 0 rows for those HIS.
+{sep} */
+WITH
+{enc_cte},
+
+RAD_ORDERS AS (
+  -- MCC
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    CAST(r.RAD_ORDER_ID AS STRING)           AS ORDER_ID,
+    r.REQUESTED_RAD_SERVICE                  AS SERVICE_NAME,
+    UPPER(TRIM(r.RAD_ORDER_PRIORITY))        AS ORDER_PRIORITY,
+    r.REQUEST_DATETIME                       AS ORDER_DATETIME,
+    r.EXAM_START_DATETIME,
+    r.RAD_REPORT_DATETIME,
+    DATEDIFF('minute', e.PATIENT_VISIT_DATETIME, r.RAD_REPORT_DATETIME)  AS Visit_to_Report_Min,
+    DATEDIFF('minute', r.EXAM_START_DATETIME,    r.RAD_REPORT_DATETIME)  AS Exam_to_Report_Min
+  FROM {enc_src}
+  JOIN NMR.MCC.RADIOLOGY r
+    ON e.ENCOUNTER_NUMBER   = CAST(r.ENCOUNTER_NUMBER AS STRING)
+   AND e.FACILITY_CODE_NHIC = CAST(r.FACILILTY_CODE AS STRING)
+   AND e.HIS = 'MCC'
+
+  UNION ALL
+
+  -- CAREWARE
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    CAST(r.RAD_ORDER_ID AS STRING),
+    r.REQUESTED_RAD_SERVICE,
+    UPPER(TRIM(r.ATS_RAD_PRIORITY_DESC)),
+    r.REQUEST_DATE_TIME,
+    r.EXAM_START_DATE_TIME, r.RAD_REPORT_DATE_TIME,
+    DATEDIFF('minute', e.PATIENT_VISIT_DATETIME, r.RAD_REPORT_DATE_TIME),
+    DATEDIFF('minute', r.EXAM_START_DATE_TIME,   r.RAD_REPORT_DATE_TIME)
+  FROM {enc_src}
+  JOIN NMR.CAREWARE.RADIOLOGY r
+    ON e.ENCOUNTER_NUMBER = CAST(r.ENCOUNTER_NUMBER AS STRING) AND e.HIS = 'CAREWARE'
+
+  UNION ALL
+
+  -- OASIS
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    CAST(r.RAD_ORDER_ID AS STRING),
+    r.REQUESTED_RAD_SERVICE,
+    UPPER(TRIM(r.REFERRAL_ORDER_PRIORITY)),
+    r.REQUEST_DATETIME,
+    r.EXAMINATION_START_DATETIME, r.RAD_REPORT_DATETIME,
+    DATEDIFF('minute', e.PATIENT_VISIT_DATETIME,      r.RAD_REPORT_DATETIME),
+    DATEDIFF('minute', r.EXAMINATION_START_DATETIME,  r.RAD_REPORT_DATETIME)
+  FROM {enc_src}
+  JOIN (SELECT DISTINCT NHIC_CODE, ENCOUNTER_NUMBER, MRN, RAD_ORDER_ID
+        FROM NMR.OASIS.EMERGENCY WHERE RAD_ORDER_ID IS NOT NULL) ek
+    ON e.FACILITY_CODE_NHIC = CAST(ek.NHIC_CODE AS STRING)
+   AND e.ENCOUNTER_NUMBER   = CAST(ek.ENCOUNTER_NUMBER AS STRING)
+   AND e.HIS = 'OASIS'
+  JOIN NMR.OASIS.RADIOLOGY r ON ek.NHIC_CODE = r.NHIC_CODE AND ek.RAD_ORDER_ID = r.RAD_ORDER_ID
+
+  UNION ALL
+
+  -- VIDAPLUS
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    r.RAD_ORDER_ID,
+    r.REQUESTED_RAD_SERVICE,
+    UPPER(TRIM(r.REFERRAL_ORDER_PRIORITY)),
+    r.REQUESTED_DATE_TIME,
+    r.EXAMINATION_START_DATE_TIME, r.RAD_REPORT_DATE_TIME,
+    DATEDIFF('minute', e.PATIENT_VISIT_DATETIME,      r.RAD_REPORT_DATE_TIME),
+    DATEDIFF('minute', r.EXAMINATION_START_DATE_TIME, r.RAD_REPORT_DATE_TIME)
+  FROM {enc_src}
+  JOIN (SELECT DISTINCT FACILITY_NHIC_CODE, ENCOUNTER_NO, MRN,
+               TRIM(f.value::STRING) AS RAD_ORDER_ID
+        FROM NMR.VIDAPLUS.EMERGENCY,
+             LATERAL FLATTEN(INPUT=>SPLIT(REGEXP_REPLACE(NVL(RAD_ORDER_IDS,''),'\\s+',''),',')) f
+        WHERE f.value IS NOT NULL AND TRIM(f.value::STRING) NOT IN ('','NULL')) vk
+    ON e.FACILITY_CODE_NHIC = CAST(vk.FACILITY_NHIC_CODE AS STRING)
+   AND e.ENCOUNTER_NUMBER   = CAST(vk.ENCOUNTER_NO AS STRING)
+   AND e.HIS = 'VIDAPLUS'
+  JOIN NMR.VIDAPLUS.RADIOLOGY r
+    ON vk.RAD_ORDER_ID = r.RAD_ORDER_ID AND vk.FACILITY_NHIC_CODE = r.FACILITY_NHIC_CODE
+
+  UNION ALL
+
+  -- ARCUSAIR
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    CAST(r.RAB_ORDER_ID AS STRING),
+    r.REQUESTED_RAD_SERVICE,
+    UPPER(TRIM(r.RAD_ORDER_PRIORITY)),
+    r.RAB_REQUEST_DATETIME,
+    r.EXAM_START_DATETIME, r.RAD_REPORT_DATETIME,
+    DATEDIFF('minute', e.PATIENT_VISIT_DATETIME, r.RAD_REPORT_DATETIME),
+    DATEDIFF('minute', r.EXAM_START_DATETIME,    r.RAD_REPORT_DATETIME)
+  FROM {enc_src}
+  JOIN NMR.ARCUSAIR.EMERGENCY ea
+    ON e.FACILITY_CODE_NHIC = CAST(ea.FACILITYID AS STRING)
+   AND e.ENCOUNTER_NUMBER   = CAST(ea.ENCOUNTER_NUMBER AS STRING)
+   AND e.HIS = 'ArcusAir'
+  JOIN NMR.ARCUSAIR.RADIOLOGY r
+    ON ea.RAD_ORDER = r.RAB_ORDER_ID AND ea.FACILITYID = r.FACILITYID AND ea.MRN = r.MRN
+)
+SELECT * FROM RAD_ORDERS
+ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit}""")
+
+    # ── PHARMACY ──────────────────────────────────────────────────────────────
+    if "Pharmacy" in order_types:
+        parts.append(f"""/* {sep}
+   ORDER-LEVEL: PHARMACY ORDERS — one row per medication order per encounter
+   Source : Raw NMR.*. PHARMACY tables joined to encounter spine
+   Columns: encounter + prescription_id + medication_code + order/dispense/admin datetimes + TAT (min)
+   Notes  : ARCUSAIR has no ADMIN_DATETIME (NULL). INTERSYSTEM/EPIC have no pharmacy sub-tables.
+{sep} */
+WITH
+{enc_cte},
+
+PHARM_ORDERS AS (
+  -- MCC
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    CAST(p.PRESCRIPTION_ID AS STRING)        AS PRESCRIPTION_ID,
+    CAST(NULL AS STRING)                     AS MEDICATION_CODE,
+    p.PRESCRIPTION_DATE_TIME                 AS ORDER_DATETIME,
+    p.DISPENSE_DATE_TIME                     AS DISPENSE_DATETIME,
+    p.MEDICINE_ADMINISTERED_DATETIME         AS ADMIN_DATETIME,
+    DATEDIFF('minute', p.PRESCRIPTION_DATE_TIME, p.DISPENSE_DATE_TIME)            AS Order_to_Dispense_Min,
+    DATEDIFF('minute', p.PRESCRIPTION_DATE_TIME, p.MEDICINE_ADMINISTERED_DATETIME) AS Order_to_Admin_Min
+  FROM {enc_src}
+  JOIN NMR.MCC.PHARMACY p
+    ON e.ENCOUNTER_NUMBER   = CAST(p.ENCOUNTER_NUMBER AS STRING)
+   AND e.FACILITY_CODE_NHIC = CAST(p.FACILILTY_CODE AS STRING)
+   AND e.HIS = 'MCC'
+
+  UNION ALL
+
+  -- CAREWARE
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    CAST(p.PRESCRIPTION_ID AS STRING), CAST(NULL AS STRING),
+    p.PRESCRIPTION_DATE, p.DISPENSE_DATE, p.DISPENSE_DATE,
+    DATEDIFF('minute', p.PRESCRIPTION_DATE, p.DISPENSE_DATE),
+    DATEDIFF('minute', p.PRESCRIPTION_DATE, p.DISPENSE_DATE)
+  FROM {enc_src}
+  JOIN NMR.CAREWARE.PHARMACY p
+    ON e.ENCOUNTER_NUMBER = CAST(p.ENCOUNTER_NUMBER AS STRING) AND e.HIS = 'CAREWARE'
+
+  UNION ALL
+
+  -- OASIS
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    CAST(p.PRESCRIPTION_ID AS STRING), CAST(NULL AS STRING),
+    p.PRESCRIPTION_DATETIME, p.DISPENSE_DATETIME, p.DISPENSE_DATETIME,
+    DATEDIFF('minute', p.PRESCRIPTION_DATETIME, p.DISPENSE_DATETIME),
+    DATEDIFF('minute', p.PRESCRIPTION_DATETIME, p.DISPENSE_DATETIME)
+  FROM {enc_src}
+  JOIN (SELECT DISTINCT NHIC_CODE, ENCOUNTER_NUMBER, MRN, PRESCRIPTION_ID
+        FROM NMR.OASIS.EMERGENCY WHERE PRESCRIPTION_ID IS NOT NULL) ek
+    ON e.FACILITY_CODE_NHIC = CAST(ek.NHIC_CODE AS STRING)
+   AND e.ENCOUNTER_NUMBER   = CAST(ek.ENCOUNTER_NUMBER AS STRING)
+   AND e.HIS = 'OASIS'
+  JOIN NMR.OASIS.PHARMACY p
+    ON ek.NHIC_CODE = p.NHIC_CODE AND ek.PRESCRIPTION_ID = p.PRESCRIPTION_ID
+
+  UNION ALL
+
+  -- VIDAPLUS
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    p.PRESCRIPTION_ORDER_ID, CAST(NULL AS STRING),
+    p.PHYSICIAN_ORDER_DATE_TIME, p.DISPENSE_DATE_TIME, p.Administered_Date_Time,
+    DATEDIFF('minute', p.PHYSICIAN_ORDER_DATE_TIME, p.DISPENSE_DATE_TIME),
+    DATEDIFF('minute', p.PHYSICIAN_ORDER_DATE_TIME, p.Administered_Date_Time)
+  FROM {enc_src}
+  JOIN (SELECT DISTINCT FACILITY_NHIC_CODE, ENCOUNTER_NO, MRN,
+               TRIM(f.value::STRING) AS PRESCRIPTION_ORDER_ID
+        FROM NMR.VIDAPLUS.EMERGENCY,
+             LATERAL FLATTEN(INPUT=>SPLIT(REGEXP_REPLACE(NVL(PRESCRIPTION_IDS,''),'\\s+',''),',')) f
+        WHERE f.value IS NOT NULL AND TRIM(f.value::STRING) NOT IN ('','NULL')) vk
+    ON e.FACILITY_CODE_NHIC = CAST(vk.FACILITY_NHIC_CODE AS STRING)
+   AND e.ENCOUNTER_NUMBER   = CAST(vk.ENCOUNTER_NO AS STRING)
+   AND e.HIS = 'VIDAPLUS'
+  JOIN NMR.VIDAPLUS.PHARMACY p
+    ON vk.PRESCRIPTION_ORDER_ID = p.PRESCRIPTION_ORDER_ID
+   AND vk.FACILITY_NHIC_CODE   = p.FACILITY_NHIC_CODE
+
+  UNION ALL
+
+  -- ARCUSAIR
+  SELECT e.FACILITY_CODE_NHIC, e.ENCOUNTER_NUMBER, e.MRN, e.PATIENT_VISIT_DATETIME, e.HIS,
+    CAST(p.PRESCRIPTION_ID AS STRING),
+    CAST(p.NHIC_MEDICATION_CODE AS STRING),
+    p.PRESCRIPTION_DATETIME, p.DISPENSE_DATE_TIME, NULL,
+    DATEDIFF('minute', p.PRESCRIPTION_DATETIME, p.DISPENSE_DATE_TIME), NULL
+  FROM {enc_src}
+  JOIN NMR.ARCUSAIR.EMERGENCY ea
+    ON e.FACILITY_CODE_NHIC = CAST(ea.FACILITYID AS STRING)
+   AND e.ENCOUNTER_NUMBER   = CAST(ea.ENCOUNTER_NUMBER AS STRING)
+   AND e.HIS = 'ArcusAir'
+  JOIN NMR.ARCUSAIR.PHARMACY p
+    ON ea.MEDICINE_ORDER = p.PRESCRIPTION_ID AND ea.FACILITYID = p.FACILITYID AND ea.MRN = p.MRN
+)
+SELECT * FROM PHARM_ORDERS
+ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit}""")
+
+    if not parts:
+        return "/* No order type selected */\nSELECT 'Select at least one order type above' AS STATUS"
+
+    return "\n\n\n".join(parts)
+
 # ─────────────────────── UI ───────────────────────────────────────────────────
 
 st.markdown("""
@@ -953,7 +1339,7 @@ if not selected:
 else:
     ff = facility.strip() if facility.strip() and facility.strip().upper() != "ALL" else ""
 
-    tab_kpi, tab_raw = st.tabs(["📊 KPI Aggregated Queries", "🔍 Raw Patient-Level Data"])
+    tab_kpi, tab_raw, tab_ord = st.tabs(["📊 KPI Aggregated Queries", "🔍 Raw Patient-Level Data", "🔬 Order-Level Drill-Down"])
 
     # ── Tab 1: KPI queries ─────────────────────────────────────────────────────
     with tab_kpi:
@@ -1041,3 +1427,68 @@ else:
         kpi_labels = ", ".join(f"KPI {n}" for n in selected)
         dt_label = f" to {dt_str}" if dt_str else ""
         rcol_dl2.caption(f"Patient-level query · {col_mode} · {len(selected)} KPI(s): {kpi_labels} · Date: {df_str}{dt_label}")
+    # ── Tab 3: Order-level drill-down ──────────────────────────────────────────
+    with tab_ord:
+        st.markdown("""
+        **Order-level drill-down** — returns one row per individual lab test, radiology exam, or
+        medication order. Use this to see the raw orders that were grouped into the encounter-level
+        counts shown in Tab 2, including exact order/exam/result timestamps and TAT per order.
+        """)
+
+        ocol1, ocol2, ocol3 = st.columns(3)
+
+        with ocol1:
+            order_types = st.multiselect(
+                "Order types to include",
+                ["Lab", "Radiology", "Pharmacy"],
+                default=["Radiology"],
+                help="Each selected type generates a separate query joined to the encounter spine.",
+            )
+
+        with ocol2:
+            ord_limit = st.selectbox(
+                "Row limit (per query)",
+                [100, 500, 1000, 5000, 10000, 0],
+                index=2,
+                format_func=lambda x: f"Top {x:,} rows" if x > 0 else "No limit (⚠️ can be very large)",
+                key="ord_limit",
+            )
+
+        with ocol3:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            st.caption("""
+            **HIS coverage:**  
+            Lab: MCC, CAREWARE, OASIS, VIDAPLUS, ARCUSAIR  
+            Rad: MCC, CAREWARE, OASIS, VIDAPLUS, ARCUSAIR  
+            Pharm: MCC, CAREWARE, OASIS, VIDAPLUS, ARCUSAIR  
+            *(INTERSYSTEM & EPIC have no sub-tables)*
+            """)
+
+        if not order_types:
+            st.info("Select at least one order type above.")
+        else:
+            ord_sql = build_order_queries(
+                selected_kpis=selected,
+                df=df_str,
+                dt=dt_str,
+                hf=his,
+                ff=ff,
+                order_types=order_types,
+                row_limit=ord_limit,
+            )
+
+            st.code(ord_sql, language="sql", line_numbers=True)
+
+            ocol_dl1, ocol_dl2 = st.columns([1, 5])
+            ocol_dl1.download_button(
+                label="⬇️ Download order .sql",
+                data=ord_sql,
+                file_name=f"ed_orders_{date.today()}.sql",
+                mime="text/plain",
+                key="dl_ord",
+            )
+            types_label = " + ".join(order_types)
+            dt_label = f" to {dt_str}" if dt_str else ""
+            ocol_dl2.caption(
+                f"Order-level query · {types_label} · HIS: {his} · Date: {df_str}{dt_label}"
+            )
