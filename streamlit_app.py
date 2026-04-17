@@ -35,17 +35,26 @@ def gran_grp(g: str) -> str:
 def src_alias(hf: str, ff: str) -> str:
     return "SW_FILTERED" if (hf != "ALL" or ff) else "SW_EMERGENCY"
 
-def cte_prefix(df: str, hf: str, ff: str) -> str:
+def cte_prefix(df: str, dt: str, hf: str, ff: str) -> str:
     hi = f"\n  AND HIS = '{hf}'" if hf != "ALL" else ""
     fa = f"\n  AND FACILITY_CODE_NHIC = '{ff}'" if ff else ""
-    body = cte_body(df)
-    if hi or fa:
-        return f"WITH {body},\n\nSW_FILTERED AS (\n  SELECT * FROM SW_EMERGENCY\n  WHERE 1=1{hi}{fa}\n)"
+    # upper-bound filter on the outer SW_FILTERED or SW_EMERGENCY wrapper
+    da = f"\n  AND PATIENT_VISIT_DATETIME::DATE <= {dt}" if dt else ""
+    body = cte_body(df, dt)
+    if hi or fa or da:
+        return f"WITH {body},\n\nSW_FILTERED AS (\n  SELECT * FROM SW_EMERGENCY\n  WHERE 1=1{hi}{fa}{da}\n)"
     return f"WITH {body}"
 
 # ─────────────────────── CTE body ────────────────────────────────────────────
 
-def cte_body(df: str) -> str:
+def cte_body(df: str, dt: str = "") -> str:
+    # upper-bound clause appended to each HIS branch WHERE
+    ub_visit   = f" AND CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) <= {dt}" if dt else ""
+    ub_visit_d = f" AND CAST(em.PATIENT_VISIT_DATE AS DATE) <= {dt}"      if dt else ""
+    ub_visitd2 = f" AND CAST(em.VISITDATE AS DATE) <= {dt}"               if dt else ""
+    ub_visit_i = f" AND CAST(em.VISIT_DATE AS DATE) <= {dt}"              if dt else ""
+    ub_arrival = f" AND CAST(em.ARRIVALINSTANT AS DATE) <= {dt}"          if dt else ""
+    ub_oasis   = f" AND CAST(VISIT_DATE_TIME AS DATE) <= {dt}"            if dt else ""
     return f"""/* ══ MCC ══════════════════════════════════════════════════════ */
 MCC_LAB AS (
   SELECT ENCOUNTER_NUMBER, FACILILTY_CODE, MEDICAL_RECORD_NUMBER_MRN,
@@ -167,7 +176,7 @@ ARC_PT AS (
 /* ══ OASIS ════════════════════════════════════════════════════════ */
 OASIS_BASE AS (
   SELECT * FROM NMR.OASIS.EMERGENCY
-  WHERE CAST(VISIT_DATE_TIME AS DATE) >= {df} AND TRIAGE_LEVEL IS NOT NULL
+  WHERE CAST(VISIT_DATE_TIME AS DATE) >= {df}{ub_oasis} AND TRIAGE_LEVEL IS NOT NULL
 ),
 OASIS_FINAL AS (
   SELECT t.NHIC_CODE,t.ENCOUNTER_NUMBER,t.MRN,t.VISIT_DATE_TIME,t.ARRIVAL_METHOD,t.REASON_FOR_VISIT,
@@ -234,7 +243,7 @@ VP_BASE AS (
     em.DECISION_TO_DISCHARGE_DATE_TIME AS DECISION_DATETIME,
     CAST(em.ADMIT_LOCATION AS STRING) AS ADMIT_LOCATION, em.discharge_status AS DISCHARGE_DESTINATION,
     em.DISCHARGE_DATE_TIME AS DISCHARGE_DATETIME, em.FETCH_TIMESTAMP
-  FROM NMR.VIDAPLUS.EMERGENCY em WHERE CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) >= {df}
+  FROM NMR.VIDAPLUS.EMERGENCY em WHERE CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) >= {df}{ub_visit}
 ),
 VP_LAB_IDS AS (
   SELECT DISTINCT b.FACILITY_NHIC_CODE,b.ENCOUNTER_NO,b.MRN,TRIM(value::STRING) AS LAB_ORDER_ID
@@ -335,7 +344,7 @@ VIDA_BASE AS (
          ELSE em.DECISION_TO_DISCHARGE_DATE_TIME END AS DECISION_DATETIME,
     CAST(NULL AS STRING) AS ADMIT_LOCATION, CAST(em.WARD_NAME AS STRING) AS DISCHARGE_DESTINATION,
     em.DISCHARGE_DATE_TIME AS DISCHARGE_DATETIME, em.FETCH_TIMESTAMP
-  FROM NMR.VIDA.EMERGENCY em WHERE CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) >= {df}
+  FROM NMR.VIDA.EMERGENCY em WHERE CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) >= {df}{ub_visit}
 ),
 VIDA_LAB_IDS AS (
   SELECT DISTINCT b.VIDA_FAC,b.ENCOUNTER_NUMBER,b.MRN,TRIM(value::STRING) AS LAB_ORDER_ID
@@ -442,7 +451,7 @@ SW_EMERGENCY AS (
   LEFT JOIN MCC_RAD   rd ON em.FACILILTY_CODE=rd.FACILILTY_CODE AND em.ENCOUNTER_NUMBER=rd.ENCOUNTER_NUMBER AND em.MEDICAL_RECORD_NUMBER_MRN=rd.MEDICAL_RECORD_NUMBER_MRN
   LEFT JOIN MCC_PHARM ph ON em.FACILILTY_CODE=ph.FACILILTY_CODE AND em.ENCOUNTER_NUMBER=ph.ENCOUNTER_NUMBER AND em.MEDICAL_RECORD_NUMBER_MRN=ph.MEDICAL_RECORD_NUMBER_MRN
   LEFT JOIN MCC_PT    p  ON em.FACILILTY_CODE=p.FACILILTY_CODE AND em.MEDICAL_RECORD_NUMBER_MRN=p.MEDICAL_RECORD_NUMBER_MRN
-  WHERE CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) >= {df}
+  WHERE CAST(em.PATIENT_VISIT_DATE_TIME AS DATE) >= {df}{ub_visit}
 
   UNION ALL
 
@@ -466,7 +475,7 @@ SW_EMERGENCY AS (
   LEFT JOIN CW_RAD   rd ON em.RAD_ORDER_ID   =rd.ENCOUNTER_NUMBER
   LEFT JOIN CW_PHARM ph ON em.PRESCRIPTION_ID=ph.ENCOUNTER_NUMBER
   LEFT JOIN CW_PT    p  ON em.FACILITY_CODE_NHIC=p.FACILITY_CODE_NHIC AND em.MEDICAL_RECORD_NUMBER_MRN=p.MEDICAL_RECORD_NUMBER_MRN
-  WHERE CAST(em.PATIENT_VISIT_DATE AS DATE) >= {df}
+  WHERE CAST(em.PATIENT_VISIT_DATE AS DATE) >= {df}{ub_visit_d}
 
   UNION ALL
 
@@ -537,7 +546,7 @@ SW_EMERGENCY AS (
   LEFT JOIN ARC_RAD   rd ON em.FACILITYID=rd.ARC_FACILITYID AND em.RAD_ORDER      =rd.RAB_ORDER_ID    AND em.MRN=rd.MRN
   LEFT JOIN ARC_PHARM ph ON em.FACILITYID=ph.ARC_FACILITYID AND em.MEDICINE_ORDER =ph.PRESCRIPTION_ID AND em.MRN=ph.MRN
   LEFT JOIN ARC_PT    p  ON em.FACILITYID=p.ARC_FACILITYID  AND em.MRN=p.MRN
-  WHERE CAST(em.VISITDATE AS DATE) >= {df}
+  WHERE CAST(em.VISITDATE AS DATE) >= {df}{ub_visitd2}
 
   UNION ALL
 
@@ -574,7 +583,7 @@ SW_EMERGENCY AS (
     NULL,NULL,NULL,NULL,NULL,
     NULL,NULL,NULL,NULL,NULL,
     FALSE,'INTERSYSTEM'
-  FROM NMR.INTERSYSTEM.EMERGENCY em WHERE CAST(em.VISIT_DATE AS DATE) >= {df}
+  FROM NMR.INTERSYSTEM.EMERGENCY em WHERE CAST(em.VISIT_DATE AS DATE) >= {df}{ub_visit_i}
 
   UNION ALL
 
@@ -589,7 +598,7 @@ SW_EMERGENCY AS (
     NULL,NULL, em.FIRSTMEDICATIONORDERINGINSTANT, NULL, em.FIRSTMEDICATIONADMINISTRATIONINSTANT,
     NULL,NULL,NULL,NULL,NULL,
     FALSE,'EPIC'
-  FROM NMR.EPIC.EMERGENCY em WHERE CAST(em.ARRIVALINSTANT AS DATE) >= {df}
+  FROM NMR.EPIC.EMERGENCY em WHERE CAST(em.ARRIVALINSTANT AS DATE) >= {df}{ub_arrival}
 )"""
 
 
@@ -624,7 +633,7 @@ KPIS = [
 
 # ─────────────────────── KPI SQL generators ──────────────────────────────────
 
-def kpi_sql(n: int, df: str, hf: str, ff: str, g: str) -> str:
+def kpi_sql(n: int, df: str, dt: str, hf: str, ff: str, g: str) -> str:
     src = src_alias(hf, ff)
     gc  = gran_col(g)
     gg  = gran_grp(g)
@@ -683,12 +692,12 @@ def kpi_sql(n: int, df: str, hf: str, ff: str, g: str) -> str:
     body = Q.get(n, "SELECT 'KPI not defined' AS STATUS")
     # KPI 21 needs extra CTEs after the main CTE block
     if n == 21:
-        prefix = cte_prefix(df, hf, ff)
+        prefix = cte_prefix(df, dt, hf, ff)
         return f"{prefix},\n{body}"
     elif n == 15:
         return body
     else:
-        return f"{cte_prefix(df, hf, ff)}\n{body}"
+        return f"{cte_prefix(df, dt, hf, ff)}\n{body}"
 
 
 def build_date_filter(mode: str, rolling: int, date_from, date_to) -> str:
@@ -697,7 +706,7 @@ def build_date_filter(mode: str, rolling: int, date_from, date_to) -> str:
     return f"'{date_from}'"
 
 
-def build_queries(selected_kpis, df, hf, ff, g) -> str:
+def build_queries(selected_kpis, df, dt, hf, ff, g) -> str:
     parts = []
     for kpi in KPIS:
         if kpi["n"] not in selected_kpis:
@@ -709,7 +718,7 @@ def build_queries(selected_kpis, df, hf, ff, g) -> str:
         tag_str = " " + " ".join(tags) if tags else ""
         sep = "=" * 66
         header = f"/* {sep}\n   KPI {n:02d} – {kpi['title']}{tag_str}\n   Source  : SW_EMERGENCY (all 8 HIS — v8)\n   Formula : {kpi['formula']}\n   Type    : {kpi['type']}\n{sep} */"
-        sql = kpi_sql(n, df, hf, ff, g)
+        sql = kpi_sql(n, df, dt, hf, ff, g)
         parts.append(f"{header}\n{sql}")
     return "\n\n\n".join(parts)
 
@@ -725,7 +734,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🏥 ED KPI Query Builder")
-st.caption("SW_EMERGENCY — all 8 HIS systems (MCC · CAREWARE · OASIS · VIDAPLUS · ARCUSAIR · VIDA · INTERSYSTEM · EPIC) · v8")
 
 # ── Sidebar filters ────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -740,12 +748,15 @@ with st.sidebar:
     if date_mode == "Rolling":
         rolling_days = st.selectbox("Window", [7, 14, 30, 60, 90], index=2)
         df_str = f"CURRENT_DATE() - {rolling_days}"
-        st.info(f"Filter: `CURRENT_DATE() - {rolling_days}`")
+        dt_str = ""
+        st.info(f"Filter: >= CURRENT_DATE() - {rolling_days}")
     else:
         col1, col2 = st.columns(2)
         d_from = col1.date_input("From", value=date.today() - timedelta(days=30))
         d_to   = col2.date_input("To",   value=date.today())
         df_str = f"'{d_from}'"
+        dt_str = f"'{d_to}'"
+        st.info(f"Filter: >= {d_from}  AND  <= {d_to}")
 
     st.divider()
     st.caption("**Legend**")
@@ -789,7 +800,7 @@ if not selected:
     st.info("Select at least one KPI above to generate SQL.")
 else:
     ff = facility.strip() if facility.strip() and facility.strip().upper() != "ALL" else ""
-    sql_out = build_queries(selected, df_str, his, ff, gran)
+    sql_out = build_queries(selected, df_str, dt_str, his, ff, gran)
 
     st.code(sql_out, language="sql", line_numbers=True)
 
@@ -800,4 +811,5 @@ else:
         file_name=f"ed_kpi_query_{date.today()}.sql",
         mime="text/plain",
     )
-    col2.caption(f"Query generated for {len(selected)} KPI(s) · HIS: {his} · Granularity: {gran} · Date filter: {df_str}")
+    dt_label = f"  to  {dt_str}" if dt_str else ""
+    col2.caption(f"Query generated for {len(selected)} KPI(s) · HIS: {his} · Gran: {gran} · Date: {df_str}{dt_label}")
