@@ -882,7 +882,7 @@ LAB_KPIS   = {4, 6, 16, 17}
 RAD_KPIS   = {4, 6, 18}
 PHARM_KPIS = {4, 5, 6}
 
-def build_order_queries(selected_kpis, df, dt, hf, ff, order_types, row_limit):
+def build_order_queries(selected_kpis, df, dt, hf, ff, order_types, row_limit, priority_filter="ALL"):
     """
     Generates one SELECT per order type (Lab / Radiology / Pharmacy).
     Joins raw per-HIS order tables directly to the encounter spine —
@@ -952,6 +952,13 @@ def build_order_queries(selected_kpis, df, dt, hf, ff, order_types, row_limit):
     limit = f"\nLIMIT {row_limit}" if row_limit else ""
     sep = "=" * 66
     parts = []
+
+    # Priority filter — applied as final WHERE on each CTE result
+    LAB_STAT_VALS = "('URGENT','ASAP','STATE','ER','STAT','URGENT/NOW/ASAP','STAT/EMERGENT')"
+    RAD_STAT_VALS = "('URGENT','ASAP','STATE','ER','STAT','EMERGENCY','URGENT/NOW/ASAP','STAT/EMERGENT')"
+    lab_pri_where = f"WHERE UPPER(TRIM(ORDER_PRIORITY)) IN {LAB_STAT_VALS}" if priority_filter == "STAT only" else ""
+    rad_pri_where = f"WHERE UPPER(TRIM(ORDER_PRIORITY)) IN {RAD_STAT_VALS}" if priority_filter == "STAT only" else ""
+    rx_pri_where  = ""  # pharmacy has no standard priority field
 
     # ── LAB ──────────────────────────────────────────────────────────────────
     if "Lab" in order_types:
@@ -1049,7 +1056,8 @@ LAB_ORDERS AS (
   JOIN NMR.ARCUSAIR.LAB l
     ON ea.LAB_ORDER = l.LAB_ORDER_ID AND ea.FACILITYID = l.FACILITYID AND ea.MRN = l.MRN
 )
-SELECT * FROM LAB_ORDERS
+SELECT DISTINCT * FROM LAB_ORDERS
+{lab_pri_where}
 ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit}""")
 
     # ── RADIOLOGY ─────────────────────────────────────────────────────────────
@@ -1157,7 +1165,8 @@ RAD_ORDERS AS (
   JOIN NMR.ARCUSAIR.RADIOLOGY r
     ON ea.RAD_ORDER = r.RAB_ORDER_ID AND ea.FACILITYID = r.FACILITYID AND ea.MRN = r.MRN
 )
-SELECT * FROM RAD_ORDERS
+SELECT DISTINCT * FROM RAD_ORDERS
+{rad_pri_where}
 ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit}""")
 
     # ── PHARMACY ──────────────────────────────────────────────────────────────
@@ -1253,7 +1262,8 @@ PHARM_ORDERS AS (
   JOIN NMR.ARCUSAIR.PHARMACY p
     ON ea.MEDICINE_ORDER = p.PRESCRIPTION_ID AND ea.FACILITYID = p.FACILITYID AND ea.MRN = p.MRN
 )
-SELECT * FROM PHARM_ORDERS
+SELECT DISTINCT * FROM PHARM_ORDERS
+{rx_pri_where}
 ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit}""")
 
     if not parts:
@@ -1455,14 +1465,16 @@ else:
             )
 
         with ocol3:
-            st.markdown("&nbsp;", unsafe_allow_html=True)
-            st.caption("""
-            **HIS coverage:**  
-            Lab: MCC, CAREWARE, OASIS, VIDAPLUS, ARCUSAIR  
-            Rad: MCC, CAREWARE, OASIS, VIDAPLUS, ARCUSAIR  
-            Pharm: MCC, CAREWARE, OASIS, VIDAPLUS, ARCUSAIR  
-            *(INTERSYSTEM & EPIC have no sub-tables)*
-            """)
+            priority_filter = st.radio(
+                "Priority filter",
+                ["STAT only", "All priorities"],
+                index=0,
+                horizontal=True,
+                help="STAT only: matches what SW_EMERGENCY counts in RAD_ORDERS_STAT / LAB_ORDERS_STAT.  All: returns every order regardless of priority.",
+                key="ord_pri",
+            )
+
+        # coverage note shown below
 
         if not order_types:
             st.info("Select at least one order type above.")
@@ -1475,6 +1487,7 @@ else:
                 ff=ff,
                 order_types=order_types,
                 row_limit=ord_limit,
+                priority_filter=priority_filter,
             )
 
             st.code(ord_sql, language="sql", line_numbers=True)
