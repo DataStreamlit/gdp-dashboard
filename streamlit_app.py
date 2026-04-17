@@ -868,7 +868,7 @@ def build_raw_query(selected_kpis, df, dt, hf, ff, col_mode, row_limit) -> str:
     sql = f"""{header}
 {cte_prefix(df, dt, hf, ff)}
 SELECT
-{chr(10).join(select_parts)}
+{(','+chr(10)).join(select_parts)}
 FROM {src} e{lu_join}
 ORDER BY e.PATIENT_VISIT_DATETIME DESC, e.FACILITY_CODE_NHIC, e.HIS{limit_clause}"""
 
