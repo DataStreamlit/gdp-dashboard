@@ -866,34 +866,40 @@ def build_raw_query(selected_kpis, df, dt, hf, ff, col_mode, row_limit) -> str:
            records, validate outliers, or export for analysis.
 {'='*66} */"""
 
-    sql = f"""{header}
-{cte_prefix(df, dt, hf, ff)}
+    cte = cte_prefix(df, dt, hf, ff)
 
-/* ── ROW COUNT PER HIS (always runs — no LIMIT) ──────────────────
-   Run this first to see how many encounters each HIS contributes.
-   Zero rows for a HIS = that system has no data for this date range
-   or facility filter. NULL columns = that HIS has no sub-table for
-   that order type (e.g. INTERSYSTEM/EPIC have no lab/rad/pharm tables).
-───────────────────────────────────────────────────────────────── */
+    q1 = f"""{header}
+
+/* ══ QUERY 1 — HIS Row Count (no LIMIT — always run this first) ═════
+   Shows how many encounters each HIS has for your date/facility filters.
+   Zero rows for a HIS means no data exists for that filter combination.
+   INTERSYSTEM and EPIC always show NULL for all order columns —
+   those HIS have no lab/rad/pharmacy sub-tables integrated yet.
+═══════════════════════════════════════════════════════════════════ */
+{cte}
 SELECT
   e.HIS,
   COUNT(DISTINCT e.ENCOUNTER_NUMBER)  AS C_Encounters,
-  MIN(e.PATIENT_VISIT_DATETIME)       AS Earliest_Visit,
-  MAX(e.PATIENT_VISIT_DATETIME)       AS Latest_Visit
-FROM {src} e{lu_join_bare}
+  MIN(e.PATIENT_VISIT_DATETIME::DATE) AS Earliest_Visit,
+  MAX(e.PATIENT_VISIT_DATETIME::DATE) AS Latest_Visit
+FROM {src} e
 GROUP BY e.HIS
-ORDER BY C_Encounters DESC;
+ORDER BY C_Encounters DESC"""
 
-
-/* ── PATIENT-LEVEL DETAIL (limited to {row_limit if row_limit else "all"} rows) ────────────────────
-   Sorted by visit date DESC — increase the row limit or filter by
-   HIS / facility if you need to see all systems.
-───────────────────────────────────────────────────────────────── */
+    limit_label = str(row_limit) if row_limit else "no limit"
+    q2 = f"""
+/* ══ QUERY 2 — Patient-Level Detail ({limit_label} rows) ══════════════════════
+   One row per encounter, sorted by HIS then date so every system
+   is visible. Increase the row limit or use the HIS/facility filter
+   in the sidebar to focus on a specific system.
+═══════════════════════════════════════════════════════════════════ */
+{cte}
 SELECT
 {(','+chr(10)).join(select_parts)}
 FROM {src} e{lu_join}
 ORDER BY e.HIS, e.PATIENT_VISIT_DATETIME DESC, e.FACILITY_CODE_NHIC{limit_clause}"""
 
+    sql = q1 + "\n\n" + q2
     return sql
 
 
