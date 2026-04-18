@@ -970,12 +970,20 @@ def build_order_queries(selected_kpis, df, dt, hf, ff, order_types, row_limit, p
   WHERE CAST(em.ARRIVALINSTANT AS DATE) >= {df}{ub_epic}
 )"""
 
-    # optional HIS / facility filter on the encounter spine
-    spine_filter = ""
-    if hf != "ALL": spine_filter += f"\n  AND HIS = '{hf}'"
-    if ff:          spine_filter += f"\n  AND FACILITY_CODE_NHIC = '{ff}'"
-    if dt:          spine_filter += f"\n  AND PATIENT_VISIT_DATETIME::DATE <= {dt}"
-    enc_src = f"(SELECT * FROM ENCOUNTERS WHERE 1=1{spine_filter}) e" if spine_filter else "ENCOUNTERS e"
+    # Each UNION ALL branch already has AND e.HIS = 'MCC' etc. hardcoded,
+    # so the encounter spine must NOT pre-filter by HIS — that would make
+    # MCC branch get 0 rows when user selects CAREWARE, etc.
+    # Instead: each branch references ENCOUNTERS directly (no HIS filter),
+    # and the HIS/facility/date filters are applied on the FINAL SELECT wrapper.
+
+    # Per-branch encounter source — always the full ENCOUNTERS CTE
+    enc_src = "ENCOUNTERS e"
+
+    # Final wrapper filter applied AFTER the UNION ALL (on LAB_ORDERS / RAD_ORDERS etc.)
+    final_filter = ""
+    if hf != "ALL": final_filter += f"\n  AND HIS = '{hf}'"
+    if ff:          final_filter += f"\n  AND FACILITY_CODE_NHIC = '{ff}'"
+    if dt:          final_filter += f"\n  AND PATIENT_VISIT_DATETIME::DATE <= {dt}"
 
     limit = f"\nLIMIT {row_limit}" if row_limit else ""
     sep = "=" * 66
@@ -984,9 +992,12 @@ def build_order_queries(selected_kpis, df, dt, hf, ff, order_types, row_limit, p
     # Priority filter — applied as final WHERE on each CTE result
     LAB_STAT_VALS = "('URGENT','ASAP','STATE','ER','STAT','URGENT/NOW/ASAP','STAT/EMERGENT')"
     RAD_STAT_VALS = "('URGENT','ASAP','STATE','ER','STAT','EMERGENCY','URGENT/NOW/ASAP','STAT/EMERGENT')"
-    lab_pri_where = f"WHERE UPPER(TRIM(ORDER_PRIORITY)) IN {LAB_STAT_VALS}" if priority_filter == "STAT only" else ""
-    rad_pri_where = f"WHERE UPPER(TRIM(ORDER_PRIORITY)) IN {RAD_STAT_VALS}" if priority_filter == "STAT only" else ""
-    rx_pri_where  = ""  # pharmacy has no standard priority field
+    lab_pri_where     = f"WHERE UPPER(TRIM(ORDER_PRIORITY)) IN {LAB_STAT_VALS}" if priority_filter == "STAT only" else ""
+    rad_pri_where     = f"WHERE UPPER(TRIM(ORDER_PRIORITY)) IN {RAD_STAT_VALS}" if priority_filter == "STAT only" else ""
+    rx_pri_where      = ""
+    lab_pri_where_and = f"\n  AND UPPER(TRIM(ORDER_PRIORITY)) IN {LAB_STAT_VALS}" if priority_filter == "STAT only" else ""
+    rad_pri_where_and = f"\n  AND UPPER(TRIM(ORDER_PRIORITY)) IN {RAD_STAT_VALS}" if priority_filter == "STAT only" else ""
+    rx_pri_where_and  = ""
 
     # ── LAB ──────────────────────────────────────────────────────────────────
     if "Lab" in order_types:
@@ -1085,7 +1096,7 @@ LAB_ORDERS AS (
     ON ea.LAB_ORDER = l.LAB_ORDER_ID AND ea.FACILITYID = l.FACILITYID AND ea.MRN = l.MRN
 )
 SELECT DISTINCT * FROM LAB_ORDERS
-{lab_pri_where}
+WHERE 1=1{final_filter}{lab_pri_where_and}
 ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit}""")
 
     # ── RADIOLOGY ─────────────────────────────────────────────────────────────
@@ -1194,7 +1205,7 @@ RAD_ORDERS AS (
     ON ea.RAD_ORDER = r.RAB_ORDER_ID AND ea.FACILITYID = r.FACILITYID AND ea.MRN = r.MRN
 )
 SELECT DISTINCT * FROM RAD_ORDERS
-{rad_pri_where}
+WHERE 1=1{final_filter}{rad_pri_where_and}
 ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit}""")
 
     # ── PHARMACY ──────────────────────────────────────────────────────────────
@@ -1291,7 +1302,7 @@ PHARM_ORDERS AS (
     ON ea.MEDICINE_ORDER = p.PRESCRIPTION_ID AND ea.FACILITYID = p.FACILITYID AND ea.MRN = p.MRN
 )
 SELECT DISTINCT * FROM PHARM_ORDERS
-{rx_pri_where}
+WHERE 1=1{final_filter}{rx_pri_where_and}
 ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit}""")
 
     if not parts:
