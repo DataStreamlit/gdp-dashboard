@@ -884,7 +884,7 @@ SELECT
   MAX(e.PATIENT_VISIT_DATETIME::DATE) AS Latest_Visit
 FROM {src} e
 GROUP BY e.HIS
-ORDER BY C_Encounters DESC"""
+ORDER BY C_Encounters DESC;"""
 
     limit_label = str(row_limit) if row_limit else "no limit"
     q2 = f"""
@@ -899,7 +899,7 @@ SELECT
 FROM {src} e{lu_join}
 ORDER BY e.HIS, e.PATIENT_VISIT_DATETIME DESC, e.FACILITY_CODE_NHIC{limit_clause}"""
 
-    sql = q1 + "\n\n" + q2
+    sql = q1 + "\n\n\n" + q2
     return sql
 
 
@@ -1097,7 +1097,7 @@ LAB_ORDERS AS (
 )
 SELECT DISTINCT * FROM LAB_ORDERS
 WHERE 1=1{final_filter}{lab_pri_where_and}
-ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit}""")
+ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit};""")
 
     # ── RADIOLOGY ─────────────────────────────────────────────────────────────
     if "Radiology" in order_types:
@@ -1206,7 +1206,7 @@ RAD_ORDERS AS (
 )
 SELECT DISTINCT * FROM RAD_ORDERS
 WHERE 1=1{final_filter}{rad_pri_where_and}
-ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit}""")
+ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit};""")
 
     # ── PHARMACY ──────────────────────────────────────────────────────────────
     if "Pharmacy" in order_types:
@@ -1303,7 +1303,7 @@ PHARM_ORDERS AS (
 )
 SELECT DISTINCT * FROM PHARM_ORDERS
 WHERE 1=1{final_filter}{rx_pri_where_and}
-ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit}""")
+ORDER BY PATIENT_VISIT_DATETIME DESC, FACILITY_CODE_NHIC, HIS, ORDER_DATETIME{limit};""")
 
     if not parts:
         return "/* No order type selected */\nSELECT 'Select at least one order type above' AS STATUS"
