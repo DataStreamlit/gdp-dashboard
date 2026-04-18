@@ -847,7 +847,8 @@ def build_raw_query(selected_kpis, df, dt, hf, ff, col_mode, row_limit) -> str:
 
     limit_clause = f"\nLIMIT {row_limit}" if row_limit else ""
 
-    lu_join = f"\nLEFT JOIN {LU} d ON TRIM(e.DISCHARGE_DESTINATION) = TRIM(d.DISCHARGE_DESTINATION)" if needs_lu else ""
+    lu_join      = f"\nLEFT JOIN {LU} d ON TRIM(e.DISCHARGE_DESTINATION) = TRIM(d.DISCHARGE_DESTINATION)" if needs_lu else ""
+    lu_join_bare = ""  # summary query doesn't need LU join
 
     # Which KPI labels are we drilling into?
     kpi_names = ", ".join(
@@ -867,10 +868,31 @@ def build_raw_query(selected_kpis, df, dt, hf, ff, col_mode, row_limit) -> str:
 
     sql = f"""{header}
 {cte_prefix(df, dt, hf, ff)}
+
+/* ── ROW COUNT PER HIS (always runs — no LIMIT) ──────────────────
+   Run this first to see how many encounters each HIS contributes.
+   Zero rows for a HIS = that system has no data for this date range
+   or facility filter. NULL columns = that HIS has no sub-table for
+   that order type (e.g. INTERSYSTEM/EPIC have no lab/rad/pharm tables).
+───────────────────────────────────────────────────────────────── */
+SELECT
+  e.HIS,
+  COUNT(DISTINCT e.ENCOUNTER_NUMBER)  AS C_Encounters,
+  MIN(e.PATIENT_VISIT_DATETIME)       AS Earliest_Visit,
+  MAX(e.PATIENT_VISIT_DATETIME)       AS Latest_Visit
+FROM {src} e{lu_join_bare}
+GROUP BY e.HIS
+ORDER BY C_Encounters DESC;
+
+
+/* ── PATIENT-LEVEL DETAIL (limited to {row_limit if row_limit else "all"} rows) ────────────────────
+   Sorted by visit date DESC — increase the row limit or filter by
+   HIS / facility if you need to see all systems.
+───────────────────────────────────────────────────────────────── */
 SELECT
 {(','+chr(10)).join(select_parts)}
 FROM {src} e{lu_join}
-ORDER BY e.PATIENT_VISIT_DATETIME DESC, e.FACILITY_CODE_NHIC, e.HIS{limit_clause}"""
+ORDER BY e.HIS, e.PATIENT_VISIT_DATETIME DESC, e.FACILITY_CODE_NHIC{limit_clause}"""
 
     return sql
 
